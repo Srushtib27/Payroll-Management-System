@@ -1,91 +1,116 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash
-from werkzeug.security import generate_password_hash, check_password_hash
+from flask import Flask, render_template, request, redirect, url_for, flash
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from werkzeug.security import check_password_hash
 import cx_Oracle
 
 app = Flask(__name__)
-app.secret_key = 'your_secret_key'
+app.secret_key = "super_secret"
 
-def get_db_connection():
-    try:
-        dsn_tns = cx_Oracle.makedsn('localhost', '1521', service_name='ORCL')
-        conn = cx_Oracle.connect(user='sys', password='Student27', dsn=dsn_tns, mode=cx_Oracle.SYSDBA)
-        return conn
-    except cx_Oracle.DatabaseError as e:
-        print(f"Database connection failed: {e}")
-        return None
+login_manager = LoginManager()
+login_manager.login_view = "login"
+login_manager.init_app(app)
 
-@app.route('/login', methods=['GET', 'POST'])
+class User(UserMixin):
+    def __init__(self, uid, username, password, role):
+        self.id = uid
+        self.username = username
+        self.password = password
+        self.role = role
+
+def get_db():
+    dsn = cx_Oracle.makedsn("localhost", 1521, "ORCL")
+    return cx_Oracle.connect("payroll_user", "pay123", dsn)
+
+@login_manager.user_loader
+def load_user(user_id):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, username, password, role FROM users WHERE id = :id", {"id": user_id})
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if row:
+        return User(*row)
+    return None
+
+def role_required(role):
+    def decorator(f):
+        def wrapper(*args, **kwargs):
+            if current_user.role != role:
+                flash("Access restricted!", "warning")
+                return redirect(url_for("dashboard"))
+            return f(*args, **kwargs)
+        wrapper.__name__ = f.__name__
+        return wrapper
+    return decorator
+
+@app.route("/login", methods=["GET", "POST"])
 def login():
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        conn = get_db_connection()
-        
-        if conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT password, role FROM users WHERE username = :1", [username])
-            user = cursor.fetchone()
-            cursor.close()
-            conn.close()
-            
-            if user and check_password_hash(user[0], password):
-                session['user_type'] = user[1]
-                flash("Logged in successfully", "success")
-                return redirect(url_for('index'))
-            else:
-                flash("Invalid username or password", "danger")
+    if request.method == "POST":
+        username = request.form["username"]
+        password = request.form["password"]
+
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT id, username, password, role FROM users WHERE username = :u", {"u": username})
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if row and check_password_hash(row[2], password):
+            user = User(*row)
+            login_user(user)
+            return redirect(url_for("dashboard"))
         else:
-            flash("Database connection failed", "danger")
+            flash("Invalid credentials!", "danger")
 
-    return render_template('main.html')
+    return render_template("index.html", page="login")
 
-@app.route('/logout')
+@app.route("/")
+@login_required
+def dashboard():
+    conn = get_db()
+    cur = conn.cursor()
+
+    if current_user.role == "hr":
+        cur.execute("SELECT employeeid, name, department FROM employee ORDER BY employeeid")
+        data = cur.fetchall()
+        return render_template("index.html", page="hr", employees=data)
+
+    elif current_user.role == "finance":
+        cur.execute("SELECT employeeid, name, salary FROM employee ORDER BY employeeid")
+        data = cur.fetchall()
+        return render_template("index.html", page="finance", employees=data)
+
+    else:  # employee
+        cur.execute("SELECT employeeid, name, department, salary FROM employee WHERE employeeid = :id",
+                    {"id": current_user.id})
+        data = cur.fetchone()
+        return render_template("index.html", page="employee", employee=data)
+
+@app.route("/process/<int:emp_id>")
+@login_required
+@role_required("finance")
+def process(emp_id):
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        cur.callproc("payroll_pkg.calculate_salary", [emp_id])
+        conn.commit()
+        flash("Payroll processed!", "success")
+    except Exception as e:
+        flash(str(e), "danger")
+
+    cur.close()
+    conn.close()
+    return redirect(url_for("dashboard"))
+
+@app.route("/logout")
 def logout():
-    session.clear()
-    flash("Logged out successfully", "success")
-    return redirect(url_for('login'))
+    logout_user()
+    return redirect(url_for("login"))
 
-@app.route('/')
-def index():
-    user_type = session.get('user_type')
-    
-    if not user_type:
-        return redirect(url_for('login'))
-    
-    conn = get_db_connection()
-    if not conn:
-        flash("Database connection failed", "danger")
-        return redirect(url_for('login'))
+if __name__ == "__main__":
+    app.run(debug=True)
 
-    cursor = conn.cursor()
-    
-    if user_type == 'hr':
-        cursor.execute("SELECT EmployeeID, Name, Department FROM Employee")
-        all_employees = cursor.fetchall()
-        cursor.close()
-        conn.close()
-        return render_template('main.html', user_type='hr', employees=all_employees)
-
-    elif user_type == 'accountant':
-        cursor.execute("SELECT EmployeeID, Name, Salary FROM Employee")
-        all_employees = cursor.fetchall()
-        cursor.close()
-        conn.close()
-        return render_template('main.html', user_type='accountant', employees=all_employees)
-
-    elif user_type == 'employee':
-        emp_id = request.args.get('id')
-        cursor.execute("SELECT EmployeeID, Name, Department, Salary FROM Employee WHERE EmployeeID = :1", [emp_id])
-        employee = cursor.fetchone()
-        cursor.close()
-        conn.close()
-
-        if employee:
-            return render_template('main.html', user_type='employee', employee=employee)
-        else:
-            flash(f"Employee with ID {emp_id} not found", "danger")
-            return render_template('main.html')
-
-if __name__ == '__main__':
-    app.debug = True
-    app.run()
