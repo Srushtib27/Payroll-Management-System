@@ -19,7 +19,7 @@ class User(UserMixin):
 
 def get_db():
     dsn = cx_Oracle.makedsn("localhost", 1521, "ORCL")
-    return cx_Oracle.connect("payroll_user", "pay123", dsn)
+    return cx_Oracle.connect(user='sys', password='Student27', dsn)
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -113,4 +113,5 @@ def logout():
 
 if __name__ == "__main__":
     app.run(debug=True)
+
 
